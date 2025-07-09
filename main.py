@@ -39,7 +39,7 @@ class XLMRobertaMLMModule(pl.LightningModule):
         
         mlm_head =  torch.nn.Sequential(
             torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.ReLU(),
+            torch.nn.GELU(), # See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L1105
             torch.nn.LayerNorm(hidden_size, eps=self.encoder.config.layer_norm_eps),
             torch.nn.Linear(hidden_size, vocab_size)
         )
@@ -102,69 +102,31 @@ class BertOnlyMLMHead(nn.Module):
     """
 
     def forward(self, input_ids, attention_mask=None):
-        """Forward pass through the model - returns only logits"""
-        # Get encoder outputs
-        encoder_outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        
-        # Get sequence output (last hidden states)
-        sequence_output = encoder_outputs.last_hidden_state
-        
-        # Pass through MLM head to get predictions
-        prediction_scores = self.mlm_head(sequence_output)
-        
+        # TODO 
+        """Forward pass through the model"""
+        encoder_outputs = self.encoder(input_ids=input_ids,attention_mask=attention_mask) # forward pass thorugh the model
+        sequence_output = encoder_outputs.last_hidden_state #Get the last output    
+        prediction_scores = self.mlm_head(sequence_output) #Pass through MLM head to get predictions
         return prediction_scores
 
     def training_step(self, batch, batch_idx):
         """Training step for MLM"""
-        # Forward pass to get logits
-        logits = self(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
-        )
-        
-        # Calculate loss
-        loss = F.cross_entropy(
-            logits.view(-1, self.tokenizer.vocab_size), 
-            batch['labels'].view(-1)
-        )
-        
-        self.log(
-            "train_loss", 
-            loss, 
-            on_step=True, 
-            on_epoch=True, 
-            prog_bar=True, 
-            logger=True
-        )
+        logits = self(input_ids=batch['input_ids'], attention_mask=batch['attention_mask']) # Call to the forward method
+        loss = F.cross_entropy(logits.view(-1, self.tokenizer.vocab_size), batch['labels'].view(-1)) # Calculate loss
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True) # ? Logging, but donno where
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Validation step for MLM"""
-        # Forward pass to get logits
-        logits = self(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
-        )
-        
-        # Calculate loss
-        loss = F.cross_entropy(
-            logits.view(-1, self.tokenizer.vocab_size), 
-            batch['labels'].view(-1)
-        )
-        
-        self.log_dict(
-            {"val_loss": loss}, 
-            on_step=False, 
-            on_epoch=True, 
-            prog_bar=True, 
-            logger=True
-        )
+        logits = self( input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+        loss = F.cross_entropy(logits.view(-1, self.tokenizer.vocab_size), batch['labels'].view(-1))
+        self.log_dict({"val_loss": loss}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+    # TODO Test_step
+
 
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler"""
+        # TODO Remove scheduler
         # Combine parameters from both encoder and MLM head
         all_parameters = list(self.encoder.parameters()) + list(self.mlm_head.parameters())
         
@@ -205,8 +167,9 @@ def main(hparams):
         max_steps=hparams.max_steps
     )
 
-    # TODO: Initialize data module (next step)
-    # datamodule = BilingualC4DataModule()
+    # TODO: Initialize data module (next step), DataModule, Datataset
+    # TODO: Collector function + Masking @Daniil :))
+    # datamodule = BilingualC4DataModule() 
 
     # Initialize trainer
     trainer = pl.Trainer(
@@ -218,17 +181,12 @@ def main(hparams):
         accumulate_grad_batches=hparams.accumulate_grad_batches,
     )
 
-    print("✅ XLM-RoBERTa MLM module initialized successfully!")
-    print(f"Model: {module.encoder.config.name_or_path}")
-    print(f"Vocabulary size: {module.tokenizer.vocab_size}")
-    print(f"Hidden size: {module.encoder.config.hidden_size}")
-    print(f"MLM head: Custom 2-layer head with GELU activation")
-    
     # TODO: Add training loop (next step)
     # trainer.fit(module, datamodule=datamodule)
 
 
 if __name__ == "__main__":
+    # TODO Remove parser!
     parser = ArgumentParser()
     parser.add_argument("--accelerator", default="auto", help="Accelerator type")
     parser.add_argument("--devices", default="auto", help="Number of devices")
