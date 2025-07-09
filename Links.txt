@@ -1,0 +1,11 @@
+Here is the stuff, we talked about:
+
+Tutorial:
+https://huggingface.co/learn/llm-course/chapter1/1
+
+Transformers Examples:
+https://github.com/huggingface/transformers/blob/main/examples/pytorch/language-modeling/run_mlm.py
+
+XLM-RoBERTa LM Head:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L1105
+
