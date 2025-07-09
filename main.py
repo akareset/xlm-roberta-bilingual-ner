@@ -18,8 +18,8 @@ class XLMRobertaMLMModule(pl.LightningModule):
         warmup_steps=1000,
         max_steps=10000
     ):
-        super().__init__() # ?Why
-        self.save_hyperparameters() # ?Why
+        super().__init__() # See lighting_example, but not sure what this does
+        self.save_hyperparameters() # same...
         
         self.encoder = AutoModel.from_pretrained(model_name) #We use AutoModel and create a cutom head later.
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -43,12 +43,66 @@ class XLMRobertaMLMModule(pl.LightningModule):
             torch.nn.LayerNorm(hidden_size, eps=self.encoder.config.layer_norm_eps),
             torch.nn.Linear(hidden_size, vocab_size)
         )
-        torch.nn.init.zeros_(mlm_head[-1].bias)
+        torch.nn.init.zeros_(mlm_head[-1].bias) # ? How does this bias work? 
     
         return mlm_head
+    
+    """
+    Relevant snippet of the transformer library:https://github.com/huggingface/transformers/blob/main/src/transformers/models/bert/modeling_bert.py
+    Around likne 700
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
-        """Forward pass through the model"""
+    class BertPredictionHeadTransform(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if isinstance(config.hidden_act, str):
+            self.transform_act_fn = ACT2FN[config.hidden_act]  # Usually GELU
+        else:
+            self.transform_act_fn = config.hidden_act
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states)
+        return hidden_states
+
+
+class BertLMPredictionHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.transform = BertPredictionHeadTransform(config)
+
+        # The output weights are the same as the input embeddings, but there is
+        # an output-only bias for each token.
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+
+        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
+        self.decoder.bias = self.bias
+
+    def _tie_weights(self):
+        self.decoder.bias = self.bias
+
+    def forward(self, hidden_states):
+        hidden_states = self.transform(hidden_states)
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+
+
+class BertOnlyMLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.predictions = BertLMPredictionHead(config)
+
+    def forward(self, sequence_output: torch.Tensor) -> torch.Tensor:
+        prediction_scores = self.predictions(sequence_output)
+        return prediction_scores
+    """
+
+    def forward(self, input_ids, attention_mask=None):
+        """Forward pass through the model - returns only logits"""
         # Get encoder outputs
         encoder_outputs = self.encoder(
             input_ids=input_ids,
@@ -61,31 +115,21 @@ class XLMRobertaMLMModule(pl.LightningModule):
         # Pass through MLM head to get predictions
         prediction_scores = self.mlm_head(sequence_output)
         
-        # Calculate loss if labels are provided
-        loss = None
-        if labels is not None:
-            loss_fn = torch.nn.CrossEntropyLoss()
-            # Flatten the tokens
-            loss = loss_fn(
-                prediction_scores.view(-1, self.tokenizer.vocab_size), 
-                labels.view(-1)
-            )
-        
-        # Return in a format similar to HuggingFace model outputs
-        return type('MLMOutput', (), {
-            'loss': loss,
-            'logits': prediction_scores,
-            'hidden_states': sequence_output
-        })()
+        return prediction_scores
 
     def training_step(self, batch, batch_idx):
         """Training step for MLM"""
-        outputs = self(
+        # Forward pass to get logits
+        logits = self(
             input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            labels=batch['labels']
+            attention_mask=batch['attention_mask']
         )
-        loss = outputs.loss
+        
+        # Calculate loss
+        loss = F.cross_entropy(
+            logits.view(-1, self.tokenizer.vocab_size), 
+            batch['labels'].view(-1)
+        )
         
         self.log(
             "train_loss", 
@@ -99,12 +143,17 @@ class XLMRobertaMLMModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """Validation step for MLM"""
-        outputs = self(
+        # Forward pass to get logits
+        logits = self(
             input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            labels=batch['labels']
+            attention_mask=batch['attention_mask']
         )
-        loss = outputs.loss
+        
+        # Calculate loss
+        loss = F.cross_entropy(
+            logits.view(-1, self.tokenizer.vocab_size), 
+            batch['labels'].view(-1)
+        )
         
         self.log_dict(
             {"val_loss": loss}, 

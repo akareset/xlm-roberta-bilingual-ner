@@ -27,18 +27,23 @@ def test_mlm_head():
     print(f"Input shape: {input_ids.shape}")
     print(f"Vocab size: {module.tokenizer.vocab_size}")
     
-    # Forward pass
+    # Forward pass (now returns only logits)
     with torch.no_grad():
-        outputs = module(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        logits = module(input_ids=input_ids, attention_mask=attention_mask)
     
-    print(f"Output logits shape: {outputs.logits.shape}")
+    print(f"Output logits shape: {logits.shape}")
     print(f"Expected shape: ({batch_size}, {seq_length}, {module.tokenizer.vocab_size})")
-    print(f"Loss: {outputs.loss}")
+    
+    # Calculate loss manually (like in training_step)
+    loss = torch.nn.functional.cross_entropy(
+        logits.view(-1, module.tokenizer.vocab_size), 
+        labels.view(-1)
+    )
+    print(f"Loss: {loss}")
     
     # Check shapes
-    assert outputs.logits.shape == (batch_size, seq_length, module.tokenizer.vocab_size)
-    assert outputs.loss is not None
-    assert outputs.loss.item() > 0  # Should have some loss
+    assert logits.shape == (batch_size, seq_length, module.tokenizer.vocab_size)
+    assert loss.item() > 0  # Should have some loss
     
     print("✅ All tests passed!")
 
