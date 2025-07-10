@@ -1,5 +1,5 @@
 from argparse import ArgumentParser
-import lightning.pytorch as pl
+import lightning.pytorch as L
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -8,23 +8,24 @@ from transformers import AutoTokenizer, AutoModel
 import datasets
 
 
-class XLMRobertaMLMModule(pl.LightningModule):
+class XLMRobertaMLMModule(L.LightningModule):
 
     def __init__(
-        self, 
+        self,
         model_name="xlm-roberta-base",
         learning_rate=5e-5,
         weight_decay=0.01,
         warmup_steps=1000,
         max_steps=10000
     ):
-        super().__init__() # See lighting_example, but not sure what this does
-        self.save_hyperparameters() # same...
-        
-        self.encoder = AutoModel.from_pretrained(model_name) #We use AutoModel and create a cutom head later.
+        super().__init__()  # See lighting_example, but not sure what this does
+        self.save_hyperparameters()  # same...
+
+        # We use AutoModel and create a cutom head later.
+        self.encoder = AutoModel.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.mlm_head = self._create_mlm_head() #Our own head
-        
+        self.mlm_head = self._create_mlm_head()  # Our own head
+
         # Hyperparameters
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -36,164 +37,116 @@ class XLMRobertaMLMModule(pl.LightningModule):
         The ReLU was choosen for the sake of simplicity"""
         hidden_size = self.encoder.config.hidden_size
         vocab_size = self.tokenizer.vocab_size
-        
-        mlm_head =  torch.nn.Sequential(
+
+        mlm_head = torch.nn.Sequential(
             torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.GELU(), # See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L1105
-            torch.nn.LayerNorm(hidden_size, eps=self.encoder.config.layer_norm_eps),
+            torch.nn.GELU(),  # See: https://github.com/huggingface/transformers/blob/main/src/transformers/models/xlm_roberta/modeling_xlm_roberta.py#L1105
+            torch.nn.LayerNorm(
+                hidden_size, eps=self.encoder.config.layer_norm_eps),
             torch.nn.Linear(hidden_size, vocab_size)
         )
-        torch.nn.init.zeros_(mlm_head[-1].bias) # ? How does this bias work? 
-    
+        torch.nn.init.zeros_(mlm_head[-1].bias)  # ? How does this bias work?
+
         return mlm_head
-    
-    """
-    Relevant snippet of the transformer library:https://github.com/huggingface/transformers/blob/main/src/transformers/models/bert/modeling_bert.py
-    Around likne 700
-
-    class BertPredictionHeadTransform(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        if isinstance(config.hidden_act, str):
-            self.transform_act_fn = ACT2FN[config.hidden_act]  # Usually GELU
-        else:
-            self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.transform_act_fn(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
-        return hidden_states
-
-
-class BertLMPredictionHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.transform = BertPredictionHeadTransform(config)
-
-        # The output weights are the same as the input embeddings, but there is
-        # an output-only bias for each token.
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
-
-        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
-        self.decoder.bias = self.bias
-
-    def _tie_weights(self):
-        self.decoder.bias = self.bias
-
-    def forward(self, hidden_states):
-        hidden_states = self.transform(hidden_states)
-        hidden_states = self.decoder(hidden_states)
-        return hidden_states
-
-
-class BertOnlyMLMHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.predictions = BertLMPredictionHead(config)
-
-    def forward(self, sequence_output: torch.Tensor) -> torch.Tensor:
-        prediction_scores = self.predictions(sequence_output)
-        return prediction_scores
-    """
 
     def forward(self, input_ids, attention_mask=None):
-        # TODO 
+        # TODO
         """Forward pass through the model"""
-        encoder_outputs = self.encoder(input_ids=input_ids,attention_mask=attention_mask) # forward pass thorugh the model
-        sequence_output = encoder_outputs.last_hidden_state #Get the last output    
-        prediction_scores = self.mlm_head(sequence_output) #Pass through MLM head to get predictions
+        encoder_outputs = self.encoder(
+            # forward pass thorugh the model
+            input_ids=input_ids, attention_mask=attention_mask)
+        sequence_output = encoder_outputs.last_hidden_state  # Get the last output
+        # Pass through MLM head to get predictions
+        prediction_scores = self.mlm_head(sequence_output)
         return prediction_scores
 
     def training_step(self, batch, batch_idx):
         """Training step for MLM"""
-        logits = self(input_ids=batch['input_ids'], attention_mask=batch['attention_mask']) # Call to the forward method
-        loss = F.cross_entropy(logits.view(-1, self.tokenizer.vocab_size), batch['labels'].view(-1)) # Calculate loss
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True) # ? Logging, but donno where
+        logits = self(
+            # Call to the forward method
+            input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+        loss = F.cross_entropy(logits.view(-1, self.tokenizer.vocab_size),
+                               batch['labels'].view(-1))  # Calculate loss
+        self.log("train_loss", loss, on_step=True,
+                 on_epoch=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Validation step for MLM"""
-        logits = self( input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
-        loss = F.cross_entropy(logits.view(-1, self.tokenizer.vocab_size), batch['labels'].view(-1))
-        self.log_dict({"val_loss": loss}, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-    # TODO Test_step
+        logits = self(input_ids=batch['input_ids'],
+                      attention_mask=batch['attention_mask'])
+        loss = F.cross_entropy(
+            logits.view(-1, self.tokenizer.vocab_size), batch['labels'].view(-1))
+        self.log("val_loss", loss, on_step=False,
+                 on_epoch=True, prog_bar=True, logger=True)
 
+    def test_step(self, batch, batch_idx):
+        """Test step for MLM"""
+        logits = self(input_ids=batch['input_ids'],
+                      attention_mask=batch['attention_mask'])
+        loss = F.cross_entropy(
+            logits.view(-1, self.tokenizer.vocab_size), batch['labels'].view(-1))
+        self.log("test_loss", loss, on_step=False,
+                 on_epoch=True, prog_bar=True, logger=True)
 
     def configure_optimizers(self):
-        """Configure optimizer and learning rate scheduler"""
-        # TODO Remove scheduler
         # Combine parameters from both encoder and MLM head
-        all_parameters = list(self.encoder.parameters()) + list(self.mlm_head.parameters())
-        
-        # AdamW optimizer (commonly used for transformer models)
-        optimizer = torch.optim.AdamW(
-            all_parameters,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay
+        all_parameters = list(self.encoder.parameters()) + \
+            list(self.mlm_head.parameters())
+        return torch.optim.AdamW(all_parameters, lr=self.learning_rate, weight_decay=self.weight_decay)
+
+
+def main(
+    accelerator: str = "auto",
+    devices: str | int = "auto",
+    learning_rate: float = 5e-5,
+    max_steps: int = 10000,
+    accumulate_grad_batches: int = 4,
+    use_wandb: bool = False,
+):
+    logger = WandbLogger(
+            log_model=False,
+            project="XLM-RoBERTa-Continual-Pretraining",
+            name="xlm-roberta-bilingual-mlm"
         )
-        
-        # Linear warmup + cosine decay scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=self.max_steps
-        )
-        
-        return [optimizer], [scheduler]
 
-
-def main(hparams):
-    """Main training function"""
-    # Initialize logging (optional for now)
-    wandb_logger = None
-    if hasattr(hparams, 'use_wandb') and hparams.use_wandb:
-        try:
-            wandb_logger = WandbLogger(
-                log_model=False, 
-                project="XLM-RoBERTa-Continual-Pretraining", 
-                name="xlm-roberta-bilingual-mlm"
-            )
-        except Exception as e:
-            print(f"Warning: Could not initialize WandB logger: {e}")
-            wandb_logger = None
-
-    # Initialize the model
     module = XLMRobertaMLMModule(
-        learning_rate=hparams.learning_rate,
-        max_steps=hparams.max_steps
+        learning_rate=learning_rate,
+        max_steps=max_steps
     )
 
-    # TODO: Initialize data module (next step), DataModule, Datataset
-    # TODO: Collector function + Masking @Daniil :))
-    # datamodule = BilingualC4DataModule() 
+    # TODO: Initialize data module, masking, etc.
+    # datamodule = BilingualC4DataModule()
 
     # Initialize trainer
-    trainer = pl.Trainer(
-        accelerator=hparams.accelerator,
-        devices=hparams.devices,
-        max_steps=hparams.max_steps,
-        logger=wandb_logger,
-        gradient_clip_val=1.0,  # Gradient clipping for stability
-        accumulate_grad_batches=hparams.accumulate_grad_batches,
+    trainer = L.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        max_steps=max_steps,
+        logger=logger,
+        gradient_clip_val=1.0,
+        accumulate_grad_batches=accumulate_grad_batches,
     )
 
-    # TODO: Add training loop (next step)
+    # TODO: Do we need to do a training loop by ourselves? 
+    """autoencoder = LitAutoEncoder(Encoder(), Decoder())
+optimizer = autoencoder.configure_optimizers()
+
+for batch_idx, batch in enumerate(train_loader):
+    loss = autoencoder.training_step(batch, batch_idx)
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()"""
     # trainer.fit(module, datamodule=datamodule)
 
 
 if __name__ == "__main__":
-    # TODO Remove parser!
-    parser = ArgumentParser()
-    parser.add_argument("--accelerator", default="auto", help="Accelerator type")
-    parser.add_argument("--devices", default="auto", help="Number of devices")
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--max_steps", type=int, default=10000, help="Maximum training steps")
-    parser.add_argument("--accumulate_grad_batches", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--use_wandb", action="store_true", help="Use WandB for logging")
-    
-    args = parser.parse_args()
-    main(args)
+    main(
+        accelerator="gpu",
+        devices=1,
+        learning_rate=3e-5,
+        max_steps=20000,
+        accumulate_grad_batches=8,
+        use_wandb=True
+    )
