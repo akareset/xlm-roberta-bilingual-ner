@@ -4,11 +4,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import WandbLogger
-from transformers import AutoTokenizer, AutoModel, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, AutoModel, DataCollatorForLanguageModeling,  get_linear_schedule_with_warmup
 import datasets
 from datasets import load_dataset, interleave_datasets
 import random
 from typing import Optional, Dict, Any
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 
 class XLMRobertaMLMModule(L.LightningModule):
@@ -96,8 +97,23 @@ class XLMRobertaMLMModule(L.LightningModule):
         # Combine parameters from both encoder and MLM head
         all_parameters = list(self.encoder.parameters()) + \
             list(self.mlm_head.parameters())
-        return torch.optim.AdamW(all_parameters, lr=self.learning_rate, weight_decay=self.weight_decay)
+        
+        optimizer = torch.optim.AdamW(all_parameters, lr=self.learning_rate, weight_decay=self.weight_decay)
 
+        # based on the paper https://arxiv.org/pdf/1901.07291, 5.1 Training details
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=self.max_steps
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step", 
+                "frequency": 1
+            }
+        }
 
 class BilingualC4DataModule(L.LightningDataModule):
     """Data module for bilingual C4 dataset (English and Yoruba) with MLM masking"""
@@ -151,19 +167,34 @@ class BilingualC4DataModule(L.LightningDataModule):
             print("Setting up training datasets...")
             en_dataset = load_dataset(
                 "allenai/c4", "en", split="train", streaming=self.streaming)
+            # TODO
+            # Yoruba has only 46,214 sentences? Validation split is also very small
+            # Should we use checkpoint averaging (end of the 6-th lecture) or some overssamplimg strrategies?
+
             yo_dataset = load_dataset(
                 "allenai/c4", "yo", split="train", streaming=self.streaming)
 
+            # Got a problem with loading dataset, therefore remove columns before interleaving
+            en_dataset = en_dataset.remove_columns(["timestamp", "url"])
+            yo_dataset = yo_dataset.remove_columns(["timestamp", "url"])
+
             # Interleave the datasets to mix English and Yoruba samples
             # Use type: ignore to handle the type checker issue
-            self.train_dataset = interleave_datasets(
-                [en_dataset, yo_dataset])  # type: ignore
+            self.train_dataset = interleave_datasets( # <-- actually quite a huge oversampling of Yoruba, as the probabilities are then 50/50  
+                [en_dataset, yo_dataset],  # type: ignore
+                probabilities=[0.7, 0.3],  # TODO think of a good probabilities, as after bi-specialization we need to fine-tune the model on English NER, catasrphical forgetting is still a thing 
+                stopping_strategy="all_exhausted") # <--- we need to use oversampling strategy, otherwise the dataset will have size of yoruba  
 
             # For validation, we'll use a smaller portion
             en_val = load_dataset("allenai/c4", "en",
                                   split="validation", streaming=self.streaming)
             yo_val = load_dataset("allenai/c4", "yo",
                                   split="validation", streaming=self.streaming)
+            
+            # Also remove columns from validation sets
+            en_val = en_val.remove_columns(["timestamp", "url"])
+            yo_val = yo_val.remove_columns(["timestamp", "url"])
+
             self.val_dataset = interleave_datasets(
                 [en_val, yo_val])  # type: ignore
 
@@ -171,7 +202,7 @@ class BilingualC4DataModule(L.LightningDataModule):
             self.train_dataset = self.train_dataset.map(
                 self._preprocess_function,
                 batched=True,
-                remove_columns=["text", "timestamp", "url"] #Remove redundant collumns, see below:
+                remove_columns=["text"] #Remove redundant collumns, see below:
             )
 
             """# Original C4 dataset structure:
@@ -260,6 +291,15 @@ def main(
         name="xlm-roberta-bilingual-mlm"
     )
 
+     # This callback will monitor the validation loss and save the best model.
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",      # The metric to monitor
+        mode="min",              # 'min' because lower loss is better
+        save_top_k=1,            # Save only the best model
+        dirpath="checkpoints/",  # Directory to save the model
+        filename="best-model-{epoch:02d}-{val_loss:.2f}" # File name for the checkpoint
+    )
+
     module = XLMRobertaMLMModule(
         learning_rate=learning_rate,
         max_steps=max_steps
@@ -287,24 +327,32 @@ def main(
         val_check_interval=1000,  # Validate every 1000 steps
         log_every_n_steps=100,    # Log every 100 steps
     )
-    # trainer.fit(module, datamodule=datamodule)
-    # TODO Do we need our own training loop?
-    """autoencoder = LitAutoEncoder(Encoder(), Decoder())
-        optimizer = autoencoder.configure_optimizers()
+    trainer.fit(module, datamodule=datamodule)
 
-        for batch_idx, batch in enumerate(train_loader):
-            loss = autoencoder.training_step(batch, batch_idx)
+    print("Training finished. Saving best model...")
+    
+    # The path to the best model saved by the callback
+    best_model_path = checkpoint_callback.best_model_path
+    print(f"Loading best model from: {best_model_path}")
 
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()"""
+    # Load the LightningModule from the best checkpoint
+    trained_model = XLMRobertaMLMModule.load_from_checkpoint(best_model_path)
+
+    # Define a path to save the final Hugging Face model
+    final_model_output_path = "./xlm-roberta-base-bilingual-specialized"
+
+    # Save the underlying Hugging Face model and tokenizer for later use
+    trained_model.encoder.save_pretrained(final_model_output_path)
+    trained_model.tokenizer.save_pretrained(final_model_output_path)
+    
+    print(f"Best model saved to {final_model_output_path}")
 
 
 if __name__ == "__main__":
     main(
         accelerator="gpu",
         devices=1,
-        learning_rate=3e-5,
+        learning_rate=10e-4, # https://proceedings.neurips.cc/paper_files/paper/2019/file/c04c19c2c2474dbf5f7ac4372c5b9af1-Paper.pdf
         max_steps=20000,
         accumulate_grad_batches=8,
         batch_size=8,        # Adjust based on your GPU memory
