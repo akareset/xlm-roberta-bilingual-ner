@@ -1,0 +1,16 @@
+# Core ML libraries
+torch>=2.0.0
+lightning>=2.0.0
+transformers>=4.30.0
+datasets>=2.0.0
+
+# Logging and monitoring
+wandb>=0.15.0
+
+# Data processing
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Optional: for better performance
+tokenizers>=0.13.0
+accelerate>=0.20.0
