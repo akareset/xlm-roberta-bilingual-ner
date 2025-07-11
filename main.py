@@ -106,14 +106,7 @@ class XLMRobertaMLMModule(L.LightningModule):
             num_warmup_steps=self.warmup_steps,
             num_training_steps=self.max_steps
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step", 
-                "frequency": 1
-            }
-        }
+        return [optimizer], [scheduler]
 
 class BilingualC4DataModule(L.LightningDataModule):
     """Data module for bilingual C4 dataset (English and Yoruba) with MLM masking"""
@@ -182,7 +175,7 @@ class BilingualC4DataModule(L.LightningDataModule):
             # Use type: ignore to handle the type checker issue
             self.train_dataset = interleave_datasets( # <-- actually quite a huge oversampling of Yoruba, as the probabilities are then 50/50  
                 [en_dataset, yo_dataset],  # type: ignore
-                probabilities=[0.7, 0.3],  # TODO think of a good probabilities, as after bi-specialization we need to fine-tune the model on English NER, catasrphical forgetting is still a thing 
+                probabilities=[0.8, 0.2],  # TODO think of a good probabilities, as after bi-specialization we need to fine-tune the model on English NER, catasrphical forgetting is still a thing 
                 stopping_strategy="all_exhausted") # <--- we need to use oversampling strategy, otherwise the dataset will have size of yoruba  
 
             # For validation, we'll use a smaller portion
@@ -296,7 +289,7 @@ def main(
         monitor="val_loss",      # The metric to monitor
         mode="min",              # 'min' because lower loss is better
         save_top_k=1,            # Save only the best model
-        dirpath="checkpoints/",  # Directory to save the model
+        dirpath="/app/checkpoints/",  # Directory to save the model (container path)
         filename="best-model-{epoch:02d}-{val_loss:.2f}" # File name for the checkpoint
     )
 
@@ -326,6 +319,7 @@ def main(
         accumulate_grad_batches=accumulate_grad_batches,
         val_check_interval=1000,  # Validate every 1000 steps
         log_every_n_steps=100,    # Log every 100 steps
+        callbacks=[checkpoint_callback],  # Add the checkpoint callback
     )
     trainer.fit(module, datamodule=datamodule)
 
@@ -339,7 +333,7 @@ def main(
     trained_model = XLMRobertaMLMModule.load_from_checkpoint(best_model_path)
 
     # Define a path to save the final Hugging Face model
-    final_model_output_path = "./xlm-roberta-base-bilingual-specialized"
+    final_model_output_path = "/app/checkpoints/xlm-roberta-base-bilingual-specialized"
 
     # Save the underlying Hugging Face model and tokenizer for later use
     trained_model.encoder.save_pretrained(final_model_output_path)
