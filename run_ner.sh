@@ -24,6 +24,6 @@ cd ~/transfer_project
 
 echo "Running ner-finetune.py" 
 
-python -u main.py
+python -u ner-finetune.py
 
 echo "Job finished at $(date)"

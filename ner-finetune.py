@@ -39,11 +39,6 @@ class XLMRobertaNER(L.LightningModule):
 
         self.metric = evaluate.load("seqeval")
 
-        # Store predictions and labels for epoch-end evaluation
-        self.val_preds = []
-        self.val_labels = []
-        self.test_preds = []
-        self.test_labels = []
 
 
     def forward(self, input_ids, attention_mask):
@@ -88,25 +83,21 @@ class XLMRobertaNER(L.LightningModule):
         true_labels = [[self.trainer.datamodule.id_to_label[l.item()] for l in label_row if l.item() != -100] for label_row in labels]
         true_predictions = [[self.trainer.datamodule.id_to_label[p.item()] for p, l in zip(pred_row, label_row) if l.item() != -100] for pred_row, label_row in zip(predictions, labels)]
 
-        self.val_preds.extend(true_predictions)
-        self.val_labels.extend(true_labels)
+        self.metric.add_batch(predictions=true_predictions, references=true_labels)
+
 
         return loss
 
     def on_validation_epoch_end(self):
         # Calculate SeqEval metrics at the end of the validation epoch
-        if len(self.val_preds) > 0 and len(self.val_labels) > 0:
-            results = self.metric.compute(predictions=self.val_preds, references=self.val_labels, scheme="IOB2") # Use IOB2 scheme
-            self.log_dict({
-                "val_precision": results["overall_precision"],
-                "val_recall": results["overall_recall"],
-                "val_f1": results["overall_f1"],
-                "val_accuracy": results["overall_accuracy"],
-            }, logger=True)
+        results = self.metric.compute(scheme="IOB2") # Use IOB2 scheme
+        self.log_dict({
+            "val_precision": results["overall_precision"],
+            "val_recall": results["overall_recall"],
+            "val_f1": results["overall_f1"],
+            "val_accuracy": results["overall_accuracy"],
+        }, logger=True)
         
-        # Clear lists for the next epoch
-        self.val_preds = []
-        self.val_labels = []
 
 
     def test_step(self, batch, batch_idx):
@@ -123,25 +114,21 @@ class XLMRobertaNER(L.LightningModule):
         true_labels = [[self.trainer.datamodule.id_to_label[l.item()] for l in label_row if l.item() != -100] for label_row in labels]
         true_predictions = [[self.trainer.datamodule.id_to_label[p.item()] for p, l in zip(pred_row, label_row) if l.item() != -100] for pred_row, label_row in zip(predictions, labels)]
 
-        self.test_preds.extend(true_predictions)
-        self.test_labels.extend(true_labels)
+        self.metric.add_batch(predictions=true_predictions, references=true_labels)
+
 
         return loss
     
     def on_test_epoch_end(self):
         # Calculate SeqEval metrics at the end of the test epoch
-        if len(self.test_preds) > 0 and len(self.test_labels) > 0:
-            results = self.metric.compute(predictions=self.test_preds, references=self.test_labels, scheme="IOB2") # Use IOB2 scheme
-            self.log_dict({
-                "test_precision": results["overall_precision"],
-                "test_recall": results["overall_recall"],
-                "test_f1": results["overall_f1"],
-                "test_accuracy": results["overall_accuracy"],
-            }, logger=True)
+        results = self.metric.compute(scheme="IOB2") # Use IOB2 scheme
+        self.log_dict({
+            "test_precision": results["overall_precision"],
+            "test_recall": results["overall_recall"],
+            "test_f1": results["overall_f1"],
+            "test_accuracy": results["overall_accuracy"],
+        }, logger=True)
         
-        # Clear lists (important if test_step is called multiple times)
-        self.test_preds = []
-        self.test_labels = []
 
     
 
@@ -345,7 +332,15 @@ def train_ner(
     wandb_logger = WandbLogger(project="MNLP-NER-Finetuning", name=f"{run_name}-seed-{seed}")
     
 
-    trainer = L.Trainer(accelerator="gpu", devices=1, max_epochs=10,max_steps=15000, logger=wandb_logger, log_every_n_steps=10)
+    trainer = L.Trainer(
+        accelerator="gpu", 
+        devices=1, 
+        max_epochs=10,
+        max_steps=15000, 
+        logger=wandb_logger, 
+        log_every_n_steps=100, 
+        enable_progress_bar=False,
+        enable_checkpointing=False)
 
     trainer.fit(module, datamodule=datamodule)
     
