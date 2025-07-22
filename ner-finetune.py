@@ -8,17 +8,18 @@ from datasets import load_dataset, DatasetDict, Dataset, Features, Value, Sequen
 from typing import Optional, Dict, Any, List
 import os
 import evaluate
+from main import XLMRobertaMLMModule
 
 
 class XLMRobertaNER(L.LightningModule):
     def __init__(
         self,
-        model_name, # or path to our pretrained model 
+        model_name, 
         num_classes,
         learning_rate,
         weight_decay,
         dropout_prob,
-        encoder: AutoModel = None # Allow passing a pre-loaded encoder
+        encoder: AutoModel = None # allow passing a pre-loaded encoder
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -26,12 +27,12 @@ class XLMRobertaNER(L.LightningModule):
         self.weight_decay = weight_decay
         self.num_labels = num_classes
 
-        # NER classification head
         if encoder:
             self.encoder = encoder
         else:
             self.encoder = AutoModel.from_pretrained(model_name)
-
+        
+        # NER classification head
         self.dropout = torch.nn.Dropout(dropout_prob)
         self.classifier = torch.nn.Linear(self.encoder.config.hidden_size, num_classes)
 
@@ -80,6 +81,8 @@ class XLMRobertaNER(L.LightningModule):
         # Store predictions and labels for SeqEval
         predictions = torch.argmax(logits, dim=-1) # Get predicted label IDs
         # We need to filter out -100 labels and map IDs back to label names
+        # Transform the numerical tensors 'labels' and 'predictions' into lists of string labels 
+        # (for example, ['O', 'B-PER', 'I-PER']), while removing all labels with -100
         true_labels = [[self.trainer.datamodule.id_to_label[l.item()] for l in label_row if l.item() != -100] for label_row in labels]
         true_predictions = [[self.trainer.datamodule.id_to_label[p.item()] for p, l in zip(pred_row, label_row) if l.item() != -100] for pred_row, label_row in zip(predictions, labels)]
 
@@ -90,7 +93,7 @@ class XLMRobertaNER(L.LightningModule):
 
     def on_validation_epoch_end(self):
         # Calculate SeqEval metrics at the end of the validation epoch
-        results = self.metric.compute(scheme="IOB2") # Use IOB2 scheme
+        results = self.metric.compute(scheme="IOB2") 
         self.log_dict({
             "val_precision": results["overall_precision"],
             "val_recall": results["overall_recall"],
@@ -130,9 +133,6 @@ class XLMRobertaNER(L.LightningModule):
         }, logger=True)
         
 
-    
-
-    # TODO We probably need slightly different hyperparameters here, as the task is slightly different. I'll research this later.
     def configure_optimizers(self):
         # Combine parameters from the encoder and the custom classifier head
         all_parameters = list(self.encoder.parameters()) + list(self.classifier.parameters())
@@ -143,7 +143,22 @@ class XLMRobertaNER(L.LightningModule):
             weight_decay=self.hparams.weight_decay
         )
 
-        return optimizer
+        # schedluer was added during the traing of the specialized models to prevent exploding gradients
+        total_steps = self.trainer.estimated_stepping_batches
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.1 * total_steps),
+            num_training_steps=total_steps
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
+            }
+        }
     
 class NERDataModule(L.LightningDataModule):
     def __init__(
@@ -152,7 +167,7 @@ class NERDataModule(L.LightningDataModule):
         model_name: str = "xlm-roberta-base",
         max_length: int = 128,
         batch_size: int = 16,
-        language: Optional[str] = None,
+        language: Optional[str] = None,         # For CoNLL-2003, language is None. For WikiANN, it's "en". For MasakhaNER, it's "yo".
         few_shot_k: Optional[int] = None
     ):
         super().__init__()
@@ -173,8 +188,9 @@ class NERDataModule(L.LightningDataModule):
         self.num_labels = None
         self.id_to_label = None
 
+        # We removed B-Date and I-Date to be able to do Zero-Shot transfer, as WikiANN has only 7 labels, and MasakhaNER - 9
         self.masakhaner_labels = [
-            "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-DATE", "I-DATE"
+            "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"
         ]
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -185,12 +201,11 @@ class NERDataModule(L.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
 
-        # For CoNLL-2003, language is None. For WikiANN, it's "en". For MasakhaNER, it's "yo".
         if self.dataset_name == "masakhaner":
             print("Loading MasakhaNER dataset directly from Parquet files...")
             data_files = {
                 "train": os.path.join("yo", "train.txt"),
-                "validation": os.path.join("yo", "dev.txt"), # Map dev.txt to validation split
+                "validation": os.path.join("yo", "dev.txt"),
                 "test": os.path.join("yo", "test.txt")
             }
             raw_datasets_dict = {
@@ -209,21 +224,19 @@ class NERDataModule(L.LightningDataModule):
         self.label_names = ner_feature.feature.names
 
         # Create a mapping from numerical ID to human-readable label name.
-        self.id_to_label = {i: label for i, label in enumerate(self.label_names)} # Changed to id_to_label
-
-        self.label_map = {i: label for i, label in enumerate(self.label_names)}
+        self.id_to_label = {i: label for i, label in enumerate(self.label_names)}
         
         # output dimension of the classification head
         self.num_labels = len(self.label_names)
 
         if self.few_shot_k:
-             # If few-shot, we create a small training set from the validation set.
-            shuffled_val = raw_datasets["validation"].shuffle(seed=2307)
+            # If few-shot, we create a small training set from the validation set.
+            shuffled_val = raw_datasets["validation"].shuffle()
             
             # Select the first k instances from the shuffled validation set to form the few-shot training dataset.
             self.train_dataset = shuffled_val.select(range(self.few_shot_k))
             
-             # Use the next k instances for validation to avoid seeing the test set
+            # Use the next k instances for validation to avoid seeing the test set
             self.val_dataset = shuffled_val.select(range(self.few_shot_k, self.few_shot_k * 2))
             self.test_dataset = raw_datasets["test"]
         else:
@@ -242,11 +255,6 @@ class NERDataModule(L.LightningDataModule):
         Parses a CoNLL-formatted file into a Dataset object.
         Each sentence is a dict with 'tokens' (list of strings) and 'ner_tags' (list of int IDs).
         Assumes standard CoNLL format: token tag per line, empty line between sentences.
-        Args:
-            filepath: Path to the CoNLL file.
-            label_names: List of all possible NER tag names.
-        Returns:
-            A datasets.Dataset object.
         """
         data = []
         tokens_buffer = []
@@ -263,11 +271,14 @@ class NERDataModule(L.LightningDataModule):
                         ner_tags_str_buffer.append(tag)
                     else:
                         continue # Skip malformed lines
-                else: # Empty line indicates end of sentence
-                    if tokens_buffer: # If there are tokens in the current sentence buffer
-                        data.append({"tokens": tokens_buffer, "ner_tags": ner_tags_str_buffer})
+                else:  # Empty line indicates end of sentence
+                    if tokens_buffer:
+                    # filter sentences with unresolved marks [B-Date, I-Date] <- remember that we removed 2 labes
+                        if all(tag in label_names for tag in ner_tags_str_buffer):
+                            data.append({"tokens": tokens_buffer, "ner_tags": ner_tags_str_buffer})
                     tokens_buffer = []
                     ner_tags_str_buffer = []
+
         
         # Add the last sentence if the file doesn't end with an empty line
         if tokens_buffer:
@@ -283,6 +294,7 @@ class NERDataModule(L.LightningDataModule):
         # Create a Dataset from the parsed data with explicit features
         return Dataset.from_list(data, features=features)
     
+
     def _tokenize_and_align_labels(self, examples):
         """
         Aligns labels with tokenized inputs, handling word splitting by the tokenizer.
@@ -310,6 +322,8 @@ class NERDataModule(L.LightningDataModule):
             max_length=self.hparams.max_length
         )
         labels = []
+
+        # https://huggingface.co/learn/llm-course/chapter7/2
         for i, label in enumerate(examples["ner_tags"]):
             word_ids = tokenized_inputs.word_ids(batch_index=i)
             previous_word_idx = None
@@ -368,7 +382,10 @@ def train_ner(
 
     if is_specialized:
         print(f"Loading specialized encoder from {model_name}")
-        pretrain_module = L.LightningModule.load_from_checkpoint(model_name, map_location="cpu")
+        pretrain_module = XLMRobertaMLMModule.load_from_checkpoint(
+            model_name, 
+            map_location="cpu"
+        )        
         
         # Extract the encoder from the loaded module
         specialized_encoder = pretrain_module.encoder
@@ -412,14 +429,13 @@ def train_ner(
         dataset_name="masakhaner",
         language="yo",
         batch_size=16,
-        few_shot_k=None # Это не few-shot обучение, а просто оценка
+        few_shot_k=None 
     )
     masakhaner_test_dm.setup()
 
 
     module.id_to_label = masakhaner_test_dm.id_to_label
 
-    # Выполняем тест модели на этом конкретном тестовом наборе
     trainer.test(module, datamodule=masakhaner_test_dm)
 
     wandb_logger.experiment.finish()
@@ -441,11 +457,8 @@ if __name__ == "__main__":
     print("--- Running Experiments for Base Model ---")
     for seed in seeds:
         #train_ner(base_model, "conll2003", None, "base-model-on-conll", seed)
-        if seed == 23:
-            train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
-        else: 
-            train_ner(base_model, "wikiann", "en", "base-model-on-wikiann", seed)
-            train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
+        train_ner(base_model, "wikiann", "en", "base-model-on-wikiann", seed)
+        train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
     
     if run_specialized:
         print("\n--- Running Experiments for Bilingual Specialized Model ---")
