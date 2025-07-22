@@ -10,7 +10,7 @@ from datasets import load_dataset, interleave_datasets
 import random
 from typing import Optional, Dict, Any
 from lightning.pytorch.callbacks import ModelCheckpoint
-
+import os
 
 class XLMRobertaMLMModule(L.LightningModule):
 
@@ -66,6 +66,8 @@ class XLMRobertaMLMModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step for MLM"""
+        self.encoder.train()
+
         logits = self(
             # Call to the forward method
             input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
@@ -101,19 +103,22 @@ class XLMRobertaMLMModule(L.LightningModule):
         optimizer = torch.optim.AdamW(all_parameters, lr=self.learning_rate, weight_decay=self.weight_decay)
 
         # based on the paper https://arxiv.org/pdf/1901.07291, 5.1 Training details
-        scheduler = get_linear_schedule_with_warmup(
+        """
+        scheduler = get_linear_schedule_with_warmup( # <--- schedluer caused problems during training
             optimizer,
             num_warmup_steps=self.warmup_steps,
             num_training_steps=self.max_steps
         )
-        return [optimizer], [scheduler]
+        """
+        # return [optimizer], [scheduler]
+        return optimizer
 
 class BilingualC4DataModule(L.LightningDataModule):
     """Data module for bilingual C4 dataset (English and Yoruba) with MLM masking"""
 
     def __init__(
         self,
-        tokenizer_name: str = "xlm-roberta-base",  # ? Duplicate tokenizer
+        tokenizer_name: str = "xlm-roberta-base", 
         max_length: int = 512,
         batch_size: int = 8,
         num_workers: int = 4,
@@ -281,7 +286,7 @@ def main(
     logger = WandbLogger(
         log_model=False,
         project="XLM-RoBERTa-Continual-Pretraining",
-        name="xlm-roberta-bilingual-mlm"
+        name="xlm-roberta-bilingual-mlm-lr=5e-5(5k)"
     )
 
      # This callback will monitor the validation loss and save the best model.
@@ -289,8 +294,8 @@ def main(
         monitor="val_loss",      # The metric to monitor
         mode="min",              # 'min' because lower loss is better
         save_top_k=1,            # Save only the best model
-        dirpath="/app/checkpoints/",  # Directory to save the model (container path)
-        filename="best-model-{epoch:02d}-{val_loss:.2f}" # File name for the checkpoint
+        dirpath="checkpoints/",  # Directory to save the model (container path)
+        filename="best-model-lr-1e-5-{val_loss:.2f}" # File name for the checkpoint
     )
 
     module = XLMRobertaMLMModule(
@@ -333,7 +338,11 @@ def main(
     trained_model = XLMRobertaMLMModule.load_from_checkpoint(best_model_path)
 
     # Define a path to save the final Hugging Face model
-    final_model_output_path = "/app/checkpoints/xlm-roberta-base-bilingual-specialized"
+    #final_model_output_path = "/app/checkpoints/xlm-roberta-base-bilingual-specialized"
+
+    project_folder = "transfer_project" # <---- change it for your directory 
+    final_model_output_path = os.path.join(os.path.expanduser("~"), project_folder, "checkpoints")
+    os.makedirs(final_model_output_path, exist_ok=True)
 
     # Save the underlying Hugging Face model and tokenizer for later use
     trained_model.encoder.save_pretrained(final_model_output_path)
@@ -346,10 +355,10 @@ if __name__ == "__main__":
     main(
         accelerator="gpu",
         devices=1,
-        learning_rate=10e-4, # https://proceedings.neurips.cc/paper_files/paper/2019/file/c04c19c2c2474dbf5f7ac4372c5b9af1-Paper.pdf
-        max_steps=20000,
+        learning_rate=1e-5, # based on the paper https://arxiv.org/pdf/1901.07291, 5.1 Training details
+        max_steps=5000,
         accumulate_grad_batches=8,
-        batch_size=8,        # Adjust based on your GPU memory
+        batch_size=8,       
         max_length=512,      # XLM-RoBERTa's max sequence length
         mlm_probability=0.15  # Standard MLM masking probability
     )

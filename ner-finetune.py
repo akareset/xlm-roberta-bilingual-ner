@@ -7,6 +7,8 @@ from transformers import AutoTokenizer, AutoModel, DataCollatorForTokenClassific
 from datasets import load_dataset
 from typing import Optional, Dict, Any, List
 import os
+import evaluate
+
 
 class XLMRobertaNER(L.LightningModule):
     def __init__(
@@ -14,26 +16,36 @@ class XLMRobertaNER(L.LightningModule):
         model_name, # or path to our pretrained model 
         num_classes,
         learning_rate,
-        warmup_steps,
         weight_decay,
         dropout_prob,
-        max_steps
+        encoder: AutoModel = None # Allow passing a pre-loaded encoder
     ):
         super().__init__()
         self.save_hyperparameters()
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.num_labels = num_classes
-        self.warmup_steps = warmup_steps
-        self.max_steps = max_steps
 
         # NER classification head
-        self.encoder = AutoModel.from_pretrained(model_name)
+        if encoder:
+            self.encoder = encoder
+        else:
+            self.encoder = AutoModel.from_pretrained(model_name)
 
         self.dropout = torch.nn.Dropout(dropout_prob)
         self.classifier = torch.nn.Linear(self.encoder.config.hidden_size, num_classes)
 
         self.loss_fn = torch.nn.CrossEntropyLoss()
+
+        self.metric = evaluate.load("seqeval")
+
+        # Store predictions and labels for epoch-end evaluation
+        self.val_preds = []
+        self.val_labels = []
+        self.test_preds = []
+        self.test_labels = []
+
+
     def forward(self, input_ids, attention_mask):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
 
@@ -44,7 +56,7 @@ class XLMRobertaNER(L.LightningModule):
         
         return logits
 
-    def training_step(self, batch, batch_idx):  # why batch_idx?
+    def training_step(self, batch, batch_idx): 
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
@@ -69,7 +81,33 @@ class XLMRobertaNER(L.LightningModule):
         
         # For now, just log loss. NER metrics (SeqEval) can be added later as requested.
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        
+        # Store predictions and labels for SeqEval
+        predictions = torch.argmax(logits, dim=-1) # Get predicted label IDs
+        # We need to filter out -100 labels and map IDs back to label names
+        true_labels = [[self.trainer.datamodule.id_to_label[l.item()] for l in label_row if l.item() != -100] for label_row in labels]
+        true_predictions = [[self.trainer.datamodule.id_to_label[p.item()] for p, l in zip(pred_row, label_row) if l.item() != -100] for pred_row, label_row in zip(predictions, labels)]
+
+        self.val_preds.extend(true_predictions)
+        self.val_labels.extend(true_labels)
+
         return loss
+
+    def on_validation_epoch_end(self):
+        # Calculate SeqEval metrics at the end of the validation epoch
+        if len(self.val_preds) > 0 and len(self.val_labels) > 0:
+            results = self.metric.compute(predictions=self.val_preds, references=self.val_labels, scheme="IOB2") # Use IOB2 scheme
+            self.log_dict({
+                "val_precision": results["overall_precision"],
+                "val_recall": results["overall_recall"],
+                "val_f1": results["overall_f1"],
+                "val_accuracy": results["overall_accuracy"],
+            }, logger=True)
+        
+        # Clear lists for the next epoch
+        self.val_preds = []
+        self.val_labels = []
+
 
     def test_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
@@ -80,12 +118,35 @@ class XLMRobertaNER(L.LightningModule):
         loss = self.loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
         
         self.log("test_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        
+        predictions = torch.argmax(logits, dim=-1)
+        true_labels = [[self.trainer.datamodule.id_to_label[l.item()] for l in label_row if l.item() != -100] for label_row in labels]
+        true_predictions = [[self.trainer.datamodule.id_to_label[p.item()] for p, l in zip(pred_row, label_row) if l.item() != -100] for pred_row, label_row in zip(predictions, labels)]
+
+        self.test_preds.extend(true_predictions)
+        self.test_labels.extend(true_labels)
+
         return loss
+    
+    def on_test_epoch_end(self):
+        # Calculate SeqEval metrics at the end of the test epoch
+        if len(self.test_preds) > 0 and len(self.test_labels) > 0:
+            results = self.metric.compute(predictions=self.test_preds, references=self.test_labels, scheme="IOB2") # Use IOB2 scheme
+            self.log_dict({
+                "test_precision": results["overall_precision"],
+                "test_recall": results["overall_recall"],
+                "test_f1": results["overall_f1"],
+                "test_accuracy": results["overall_accuracy"],
+            }, logger=True)
+        
+        # Clear lists (important if test_step is called multiple times)
+        self.test_preds = []
+        self.test_labels = []
+
     
 
     # TODO We probably need slightly different hyperparameters here, as the task is slightly different. I'll research this later.
     def configure_optimizers(self):
-        """Configures the optimizer and learning rate scheduler."""
         # Combine parameters from the encoder and the custom classifier head
         all_parameters = list(self.encoder.parameters()) + list(self.classifier.parameters())
         
@@ -95,20 +156,7 @@ class XLMRobertaNER(L.LightningModule):
             weight_decay=self.hparams.weight_decay
         )
 
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.hparams.warmup_steps,
-            num_training_steps=self.max_steps
-        )
-        
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step", 
-                "frequency": 1
-            }
-        }
+        return optimizer
     
 class NERDataModule(L.LightningDataModule):
     def __init__(
@@ -129,15 +177,26 @@ class NERDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.few_shot_k = few_shot_k
         
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+
+        self.label_names = None
+        self.label_map = None
+        self.num_labels = None
+        self.id_to_label = None
+
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         # Data collator specifically for token classification
         self.data_collator = DataCollatorForTokenClassification(tokenizer=self.tokenizer)
 
-    def prepare_data(self):
-        load_dataset(self.dataset_name, self.language)
+
 
     def setup(self, stage: Optional[str] = None):
-        raw_datasets = load_dataset(self.hparams.dataset_name, self.hparams.dataset_config_name)
+
+        # For CoNLL-2003, language is None. For WikiANN, it's "en". For MasakhaNER, it's "yo".
+        raw_datasets = load_dataset(self.dataset_name, self.language)
         
         ner_feature = raw_datasets["train"].features["ner_tags"]
         
@@ -145,56 +204,56 @@ class NERDataModule(L.LightningDataModule):
         self.label_names = ner_feature.feature.names
 
         # Create a mapping from numerical ID to human-readable label name.
+        self.id_to_label = {i: label for i, label in enumerate(self.label_names)} # Changed to id_to_label
+
         self.label_map = {i: label for i, label in enumerate(self.label_names)}
         
         # output dimension of the classification head
         self.num_labels = len(self.label_names)
 
-        if self.hparams.few_shot_k:
+        if self.few_shot_k:
              # If few-shot, we create a small training set from the validation set.
-            shuffled_val = raw_datasets["validation"].shuffle(seed=42)
+            shuffled_val = raw_datasets["validation"].shuffle(seed=2307)
             
-            # Select the first 'k' instances from the shuffled validation set to form the few-shot training dataset.
-            self.train_dataset = shuffled_val.select(range(self.hparams.few_shot_k))
+            # Select the first k instances from the shuffled validation set to form the few-shot training dataset.
+            self.train_dataset = shuffled_val.select(range(self.few_shot_k))
             
-            self.val_dataset = raw_datasets["test"]
+             # Use the next k instances for validation to avoid seeing the test set
+            self.val_dataset = shuffled_val.select(range(self.few_shot_k, self.few_shot_k * 2))
             self.test_dataset = raw_datasets["test"]
         else:
             self.train_dataset = raw_datasets["train"]
             self.val_dataset = raw_datasets["validation"]
             self.test_dataset = raw_datasets["test"]
 
-        self.train_dataset = self.train_dataset.map(self._tokenize_and_align_labels, batched=True)
-        self.val_dataset = self.val_dataset.map(self._tokenize_and_align_labels, batched=True)
-        self.test_dataset = self.test_dataset.map(self._tokenize_and_align_labels, batched=True)
+        column_names = raw_datasets["train"].column_names
+
+        self.train_dataset = self.train_dataset.map(self._tokenize_and_align_labels, batched=True, remove_columns=column_names)
+        self.val_dataset = self.val_dataset.map(self._tokenize_and_align_labels, batched=True, remove_columns=column_names)
+        self.test_dataset = self.test_dataset.map(self._tokenize_and_align_labels, batched=True, remove_columns=column_names)
     
     
     
     def _tokenize_and_align_labels(self, examples):
         """
-        The core idea of this function is to solve the mismatch that happens when a word-based tokenizer splits a single word into multiple sub-word tokens.
+        Aligns labels with tokenized inputs, handling word splitting by the tokenizer.
 
-        For example, the word "Washington" might be tokenized into ["Washing", "##ton"]. 
-        The original dataset has only one label for "Washington" (e.g., B-LOC), but now we have two sub-word tokens.
+        When a single word is split into multiple sub-word tokens (e.g., "Washington" -> ["Washing", "##ton"]),
+        this function ensures that all sub-words receive a meaningful label.
 
-        The function aligns the labels to these new sub-words using a simple strategy:
+        The strategy is as follows:
+        1.  The first sub-word of a split token gets the original label (e.g., "B-LOC").
+        2.  Subsequent sub-words from the same original word are assigned the corresponding "inside" label
+            (e.g., "I-LOC"). This assumes a B-I labeling scheme where I-Tag = B-Tag + 1.
+        3.  Special tokens like [CLS] and [SEP] are assigned -100 to be ignored by the loss function.
 
-        Assign the Label to the First Sub-word: The original label (B-LOC) is assigned only to the first sub-word token ("Washing").
-        Ignore Subsequent Sub-words: All other sub-word tokens from the same original word ("##ton") are given a special label of -100.
-        Ignore Special Tokens: Special tokens added by the tokenizer, like [CLS] and [SEP], are also given the label -100.
-            
-            Example:
+            Example (assuming B-LOC=3, I-LOC=4):
         - Original words:  ["Washington", "is", "a", "city"]
-        - Original labels: [3 (B-LOC),  0 (O), 0 (O), 0 (O)]
+        - Original labels: [3,           0,    0,    0]
 
         - Tokenized words: ["[CLS]", "Washing", "##ton", "is", "a", "city", "[SEP]"]
-        - Aligned labels:  [-100,    3,         -100,    0,    0,   0,      -100]
+        - Aligned labels:  [-100,    3,         4,       0,    0,   0,      -100]
         """
-
-        # TODO 
-        # Isn't it the problem that we ignore the subsequent subwords if split the word? 
-        # I think Bendedict said that all subwords need to have labels, like ORG_Out, ORG_in etc. 
-    
         tokenized_inputs = self.tokenizer(
             examples["tokens"],
             truncation=True,
@@ -207,20 +266,21 @@ class NERDataModule(L.LightningDataModule):
             previous_word_idx = None
             label_ids = []
             for word_idx in word_ids:
-                # Special tokens (like CLS, SEP) and padding tokens have None word_idx
+                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+                # ignored in the loss function.
                 if word_idx is None:
-                    label_ids.append(-100) # Ignore these tokens for loss calculation
-                
-                # If it's a new word or the first token of a word
+                    label_ids.append(-100)
+                # We set the label for the first token of each word.
                 elif word_idx != previous_word_idx:
-                    # Append the label of the current word
                     label_ids.append(label[word_idx])
-                
-                # If it's a subsequent token of the same word
+                # For the other tokens in a word, we set the label to the corresponding "I-" tag.
                 else:
-                    label_ids.append(-100) # ignore it
-
-                # update the previous_word_idx for the next iteration.
+                    current_label = label[word_idx]
+                    # If the label is a B-tag (odd number), convert it to an I-tag (even number)
+                    if current_label % 2 == 1:
+                        label_ids.append(current_label + 1)
+                    else:
+                        label_ids.append(current_label)
                 previous_word_idx = word_idx
             labels.append(label_ids)
         tokenized_inputs["labels"] = labels
@@ -235,7 +295,6 @@ class NERDataModule(L.LightningDataModule):
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.hparams.batch_size, collate_fn=self.data_collator, num_workers=4)
     
-#TODO  Carefully go through the code below, it's 1:25 and I've made too many variable name changes😅 And check the logic
 
 def train_ner(
     model_name: str,
@@ -244,59 +303,85 @@ def train_ner(
     run_name: str,
     seed: int,
     few_shot_k: Optional[int] = None,
+    is_specialized: bool = False
 ):
+    """
+    Function to run a single NER training/evaluation experiment
+    """
+
     print(f"\n--- Starting Run: {run_name} (Seed: {seed}) ---")
     print(f"Model: {model_name}, Dataset: {dataset_name} ({language})")
 
     L.seed_everything(seed)
 
-    datamodule = NERDataModule(model_name=model_name, dataset_name=dataset_name, language=language, batch_size=16, few_shot_k=few_shot_k)
+    datamodule = NERDataModule(model_name="xlm-roberta-base", dataset_name=dataset_name, language=language, batch_size=16, few_shot_k=few_shot_k)
     datamodule.setup()
 
-    # TODO I used some temporar parameters, we need to establish the best one
-    module = XLMRobertaNER(model_name=model_name,
-                           num_labels=datamodule.num_labels, 
-                           learning_rate=2e-5,
-                           weight_decay=0.01,
-                           warmup_steps = 1000,
-                           dropout_prob=0.1,
-                           max_steps=20000
-                        )
+    if is_specialized:
+        print(f"Loading specialized encoder from {model_name}")
+        pretrain_module = L.LightningModule.load_from_checkpoint(model_name, map_location="cpu")
+        
+        # Extract the encoder from the loaded module
+        specialized_encoder = pretrain_module.encoder
+        module = XLMRobertaNER(
+            model_name="xlm-roberta-base", # Pass name for tokenizer init inside module
+            num_classes=datamodule.num_labels, 
+            learning_rate=5e-5,
+            weight_decay=0.01,
+            dropout_prob=0.1,
+            encoder=specialized_encoder # Pass the loaded specialized encoder
+        )
+    else:
+        print(f"Loading base model {model_name}")
+        module = XLMRobertaNER(
+            model_name=model_name,
+            num_classes=datamodule.num_labels, 
+            learning_rate=5e-5,
+            weight_decay=0.01,
+            dropout_prob=0.1,
+        )
+
 
     wandb_logger = WandbLogger(project="MNLP-NER-Finetuning", name=f"{run_name}-seed-{seed}")
     
 
-    trainer = L.Trainer(accelerator="gpu", devices=1, max_epochs=10, logger=wandb_logger, log_every_n_steps=10)
+    trainer = L.Trainer(accelerator="gpu", devices=1, max_epochs=10,max_steps=15000, logger=wandb_logger, log_every_n_steps=10)
 
     trainer.fit(module, datamodule=datamodule)
     
+    print(f"--- Running Final Evaluation on MasakhaNER for {run_name} (Seed: {seed}) ---")
+    masakhaner_dm = NERDataModule(model_name="xlm-roberta-base", dataset_name="masakhaner", language="yo", batch_size=16)
+    masakhaner_dm.setup()
+    # module.id_to_label = masakhaner_dm.label_map # Ensure correct map for testing
+    trainer.test(module, datamodule=masakhaner_dm)
+
     wandb_logger.experiment.finish()
     print(f"--- Finished Run: {run_name} (Seed: {seed}) ---")
 
 
 if __name__ == "__main__":
-    SEEDS = [42, 1116, 22314]
-    BASE_MODEL = "xlm-roberta-base"
-    SPECIALIZED_MODEL = "./xlm-roberta-base-bilingual-specialized"
+    seeds = [23, 7, 2025]
+    base_model = "xlm-roberta-base"
+    specialized_model = os.path.join(os.path.expanduser("~"), "transfer_project", "checkpoints", "best-model-lr-1e-5-val_loss=3.67.ckpt")
 
-    if not os.path.exists(SPECIALIZED_MODEL):
-        print(f"Warning: Specialized model not found at {SPECIALIZED_MODEL}")
+    if not os.path.exists(specialized_model):
+        print(f"Warning: Specialized model not found at {specialized_model}")
         print("Skipping experiments for the specialized model.")
         run_specialized = False
     else:
         run_specialized = True
 
     print("--- Running Experiments for Base Model ---")
-    for seed in SEEDS:
-        train_ner(BASE_MODEL, "conll2003", None, "base-model-on-conll", seed)
-        train_ner(BASE_MODEL, "wikiann", "en", "base-model-on-wikiann", seed)
-        train_ner(BASE_MODEL, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
+    for seed in seeds:
+        #train_ner(base_model, "conll2003", None, "base-model-on-conll", seed)
+        train_ner(base_model, "wikiann", "en", "base-model-on-wikiann", seed)
+        train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
     
     if run_specialized:
         print("\n--- Running Experiments for Bilingual Specialized Model ---")
-        for seed in SEEDS:
-            train_ner(SPECIALIZED_MODEL, "conll2003", None, "specialized-on-conll", seed)
-            train_ner(SPECIALIZED_MODEL, "wikiann", "en", "specialized-on-wikiann", seed)
-            train_ner(SPECIALIZED_MODEL, "masakhaner", "yo", "specialized-on-masakhaner-100", seed, few_shot_k=100)
+        for seed in seeds:
+            #train_ner(specialized_model, "conll2003", None, "specialized-on-conll", seed, is_specialized=True)
+            train_ner(specialized_model, "wikiann", "en", "specialized-on-wikiann", seed, is_specialized=True)
+            train_ner(specialized_model, "masakhaner", "yo", "specialized-on-masakhaner-100", seed, is_specialized=True, few_shot_k=100)
 
     print("\n--- All experiments finished! ---")
