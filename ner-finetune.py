@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import WandbLogger
 from transformers import AutoTokenizer, AutoModel, DataCollatorForTokenClassification, get_linear_schedule_with_warmup
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict, Dataset, Features, Value, Sequence, ClassLabel
 from typing import Optional, Dict, Any, List
 import os
 import evaluate
@@ -173,6 +173,9 @@ class NERDataModule(L.LightningDataModule):
         self.num_labels = None
         self.id_to_label = None
 
+        self.masakhaner_labels = [
+            "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-DATE", "I-DATE"
+        ]
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         # Data collator specifically for token classification
@@ -183,7 +186,22 @@ class NERDataModule(L.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
 
         # For CoNLL-2003, language is None. For WikiANN, it's "en". For MasakhaNER, it's "yo".
-        raw_datasets = load_dataset(self.dataset_name, self.language)
+        if self.dataset_name == "masakhaner":
+            print("Loading MasakhaNER dataset directly from Parquet files...")
+            data_files = {
+                "train": os.path.join("yo", "train.txt"),
+                "validation": os.path.join("yo", "dev.txt"), # Map dev.txt to validation split
+                "test": os.path.join("yo", "test.txt")
+            }
+            raw_datasets_dict = {
+                split: self._parse_conll_file(path, self.masakhaner_labels)
+                for split, path in data_files.items()
+            }
+            raw_datasets = DatasetDict(raw_datasets_dict)
+        
+        else:
+            # For other datasets, the standard loading method works.
+            raw_datasets = load_dataset(self.dataset_name, self.language)
         
         ner_feature = raw_datasets["train"].features["ner_tags"]
         
@@ -219,7 +237,51 @@ class NERDataModule(L.LightningDataModule):
         self.val_dataset = self.val_dataset.map(self._tokenize_and_align_labels, batched=True, remove_columns=column_names)
         self.test_dataset = self.test_dataset.map(self._tokenize_and_align_labels, batched=True, remove_columns=column_names)
     
-    
+    def _parse_conll_file(self, filepath: str, label_names: List[str]) -> Dataset:
+        """
+        Parses a CoNLL-formatted file into a Dataset object.
+        Each sentence is a dict with 'tokens' (list of strings) and 'ner_tags' (list of int IDs).
+        Assumes standard CoNLL format: token tag per line, empty line between sentences.
+        Args:
+            filepath: Path to the CoNLL file.
+            label_names: List of all possible NER tag names.
+        Returns:
+            A datasets.Dataset object.
+        """
+        data = []
+        tokens_buffer = []
+        ner_tags_str_buffer = [] # Buffer to store string tags
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line: # Not an empty line
+                    parts = line.split()
+                    if len(parts) == 2: # Expecting "token tag" format
+                        token, tag = parts
+                        tokens_buffer.append(token)
+                        ner_tags_str_buffer.append(tag)
+                    else:
+                        continue # Skip malformed lines
+                else: # Empty line indicates end of sentence
+                    if tokens_buffer: # If there are tokens in the current sentence buffer
+                        data.append({"tokens": tokens_buffer, "ner_tags": ner_tags_str_buffer})
+                    tokens_buffer = []
+                    ner_tags_str_buffer = []
+        
+        # Add the last sentence if the file doesn't end with an empty line
+        if tokens_buffer:
+            data.append({"tokens": tokens_buffer, "ner_tags": ner_tags_str_buffer})
+
+        # Define features with ClassLabel for 'ner_tags' to enable automatic string-to-ID mapping
+        # and ensure correct type.
+        features = Features({
+            "tokens": Sequence(Value("string")),
+            "ner_tags": Sequence(ClassLabel(names=label_names))
+        })
+        
+        # Create a Dataset from the parsed data with explicit features
+        return Dataset.from_list(data, features=features)
     
     def _tokenize_and_align_labels(self, examples):
         """
@@ -344,11 +406,21 @@ def train_ner(
 
     trainer.fit(module, datamodule=datamodule)
     
-    print(f"--- Running Final Evaluation on MasakhaNER for {run_name} (Seed: {seed}) ---")
-    masakhaner_dm = NERDataModule(model_name="xlm-roberta-base", dataset_name="masakhaner", language="yo", batch_size=16)
-    masakhaner_dm.setup()
-    # module.id_to_label = masakhaner_dm.label_map # Ensure correct map for testing
-    trainer.test(module, datamodule=masakhaner_dm)
+    print(f"--- Running Final Evaluation on MasakhaNER Yoruba Test Set for {run_name} (Seed: {seed}) ---")
+    masakhaner_test_dm = NERDataModule(
+        model_name="xlm-roberta-base", 
+        dataset_name="masakhaner",
+        language="yo",
+        batch_size=16,
+        few_shot_k=None # Это не few-shot обучение, а просто оценка
+    )
+    masakhaner_test_dm.setup()
+
+
+    module.id_to_label = masakhaner_test_dm.id_to_label
+
+    # Выполняем тест модели на этом конкретном тестовом наборе
+    trainer.test(module, datamodule=masakhaner_test_dm)
 
     wandb_logger.experiment.finish()
     print(f"--- Finished Run: {run_name} (Seed: {seed}) ---")
@@ -369,8 +441,11 @@ if __name__ == "__main__":
     print("--- Running Experiments for Base Model ---")
     for seed in seeds:
         #train_ner(base_model, "conll2003", None, "base-model-on-conll", seed)
-        train_ner(base_model, "wikiann", "en", "base-model-on-wikiann", seed)
-        train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
+        if seed == 23:
+            train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
+        else: 
+            train_ner(base_model, "wikiann", "en", "base-model-on-wikiann", seed)
+            train_ner(base_model, "masakhaner", "yo", "base-model-on-masakhaner-100", seed, few_shot_k=100)
     
     if run_specialized:
         print("\n--- Running Experiments for Bilingual Specialized Model ---")
