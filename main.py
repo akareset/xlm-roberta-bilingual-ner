@@ -22,8 +22,8 @@ class XLMRobertaMLMModule(L.LightningModule):
         warmup_steps=1000,
         max_steps=10000
     ):
-        super().__init__()  # See lighting_example, but not sure what this does
-        self.save_hyperparameters()  # same...
+        super().__init__() # Initializes the Lightning module
+        self.save_hyperparameters()  # Automatically saves all constructor arguments to enable model checkpointing/loadin
 
         # We use AutoModel and create a cutom head later.
         self.encoder = AutoModel.from_pretrained(model_name)
@@ -37,8 +37,7 @@ class XLMRobertaMLMModule(L.LightningModule):
         self.max_steps = max_steps
 
     def _create_mlm_head(self):
-        """Implementation inspired by the Bert MLM Prediction head from the transformers module.
-        The ReLU was choosen for the sake of simplicity"""
+        """Implementation inspired by the Bert MLM Prediction head from the transformers module."""
         hidden_size = self.encoder.config.hidden_size
         vocab_size = self.tokenizer.vocab_size
 
@@ -49,13 +48,11 @@ class XLMRobertaMLMModule(L.LightningModule):
                 hidden_size, eps=self.encoder.config.layer_norm_eps),
             torch.nn.Linear(hidden_size, vocab_size)
         )
-        torch.nn.init.zeros_(mlm_head[-1].bias)  # ? How does this bias work?
+        torch.nn.init.zeros_(mlm_head[-1].bias)  # Sets the bias of the last layer to zero
 
         return mlm_head
 
     def forward(self, input_ids, attention_mask=None):
-        # TODO
-        """Forward pass through the model"""
         encoder_outputs = self.encoder(
             # forward pass thorugh the model
             input_ids=input_ids, attention_mask=attention_mask)
@@ -66,11 +63,11 @@ class XLMRobertaMLMModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """Training step for MLM"""
-        self.encoder.train()
+        self.encoder.train() # Set the model to training mode
 
         logits = self(
             # Call to the forward method
-            input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            input_ids=batch['input_ids'], attention_mask=batch['attention_mask']) # Input tokens +  Binary mask indicating which tokens are real and not
         loss = F.cross_entropy(logits.view(-1, self.tokenizer.vocab_size),
                                batch['labels'].view(-1))  # Calculate loss
         self.log("train_loss", loss, on_step=True,
@@ -97,9 +94,7 @@ class XLMRobertaMLMModule(L.LightningModule):
 
     def configure_optimizers(self):
         # Combine parameters from both encoder and MLM head
-        all_parameters = list(self.encoder.parameters()) + \
-            list(self.mlm_head.parameters())
-        
+        all_parameters = list(self.encoder.parameters()) + list(self.mlm_head.parameters())
         optimizer = torch.optim.AdamW(all_parameters, lr=self.learning_rate, weight_decay=self.weight_decay)
 
         # based on the paper https://arxiv.org/pdf/1901.07291, 5.1 Training details
@@ -147,13 +142,13 @@ class BilingualC4DataModule(L.LightningDataModule):
         Leaves 10% unchanged
         Creates the labels tensor with -100 for non-masked positions (ignored in loss calculation)"""
     
-        self.data_collator = DataCollatorForLanguageModeling(
+        self.data_collator = DataCollatorForLanguageModeling( # Tokenizes the data and applies MASK
             tokenizer=self.tokenizer,
             mlm=True,
             mlm_probability=self.mlm_probability,
         )
 
-    def prepare_data(self):
+    def prepare_data(self): # Downloads the data
         print("Loading English C4 dataset...")
         load_dataset("allenai/c4", "en", streaming=self.streaming)
         print("Loading Yoruba C4 dataset...")
@@ -162,13 +157,8 @@ class BilingualC4DataModule(L.LightningDataModule):
     def setup(self, stage: Optional[str] = None): # ?  What is stage? 
         """Set up the datasets for training, validation, and testing"""
         if stage == "fit" or stage is None:
-            print("Setting up training datasets...")
             en_dataset = load_dataset(
                 "allenai/c4", "en", split="train", streaming=self.streaming)
-            # TODO
-            # Yoruba has only 46,214 sentences? Validation split is also very small
-            # Should we use checkpoint averaging (end of the 6-th lecture) or some overssamplimg strrategies?
-
             yo_dataset = load_dataset(
                 "allenai/c4", "yo", split="train", streaming=self.streaming)
 
@@ -178,10 +168,10 @@ class BilingualC4DataModule(L.LightningDataModule):
 
             # Interleave the datasets to mix English and Yoruba samples
             # Use type: ignore to handle the type checker issue
-            self.train_dataset = interleave_datasets( # <-- actually quite a huge oversampling of Yoruba, as the probabilities are then 50/50  
-                [en_dataset, yo_dataset],  # type: ignore
-                probabilities=[0.8, 0.2],  # TODO think of a good probabilities, as after bi-specialization we need to fine-tune the model on English NER, catasrphical forgetting is still a thing 
-                stopping_strategy="all_exhausted") # <--- we need to use oversampling strategy, otherwise the dataset will have size of yoruba  
+            self.train_dataset = interleave_datasets(
+                [en_dataset, yo_dataset],                # type: ignore
+                probabilities=[0.8, 0.2],   # Youruba will be recycled multiple times (6.500 times...)
+                stopping_strategy="all_exhausted")           # <--- we need to use oversampling strategy, otherwise the dataset will have size of yoruba  
 
             # For validation, we'll use a smaller portion
             en_val = load_dataset("allenai/c4", "en",
@@ -245,10 +235,10 @@ class BilingualC4DataModule(L.LightningDataModule):
         # Tokenize the texts
         tokenized = self.tokenizer(
             examples["text"],
-            truncation=True,
-            padding=False,  # We'll pad in the data collator
+            truncation=True, #If text is over 512 tokens
+            padding=False,  # We'll pad in the data collator to the longest in batch (more efficient)
             max_length=self.max_length,
-            return_special_tokens_mask=True,
+            return_special_tokens_mask=True, # Creates a mask to prvent special tokens from being masked out
         )
         return tokenized
 
@@ -286,13 +276,13 @@ def main(
     logger = WandbLogger(
         log_model=False,
         project="XLM-RoBERTa-Continual-Pretraining",
-        name="xlm-roberta-bilingual-mlm-lr=5e-5(5k)"
+        name="xlm-roberta-bilingual-mlm-lr=1e-5(5k)"
     )
 
      # This callback will monitor the validation loss and save the best model.
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",      # The metric to monitor
-        mode="min",              # 'min' because lower loss is better
+        mode="min",              # 'min' because we minimize the loss
         save_top_k=1,            # Save only the best model
         dirpath="checkpoints/",  # Directory to save the model (container path)
         filename="best-model-lr-1e-5-{val_loss:.2f}" # File name for the checkpoint
@@ -310,7 +300,7 @@ def main(
         batch_size=batch_size,
         mlm_probability=mlm_probability,
         streaming=True,  # Use streaming for large dataset
-        train_size=None,  # Use full dataset, or set a number for testing
+        train_size=None,  # We use the full train dataset
         val_size=10000,   # Limit validation size for faster validation
     )
 
@@ -320,7 +310,7 @@ def main(
         devices=devices,
         max_steps=max_steps,
         logger=logger,
-        gradient_clip_val=1.0,
+        gradient_clip_val=1.0, #prevent exploding gradiens compute the L2 norm, if larger then 1 obtain the clipping coefficient and scale down the gradient
         accumulate_grad_batches=accumulate_grad_batches,
         val_check_interval=1000,  # Validate every 1000 steps
         log_every_n_steps=100,    # Log every 100 steps
@@ -356,7 +346,7 @@ if __name__ == "__main__":
         accelerator="gpu",
         devices=1,
         learning_rate=1e-5, # based on the paper https://arxiv.org/pdf/1901.07291, 5.1 Training details
-        max_steps=5000,
+        max_steps=5000, # only 5k batches
         accumulate_grad_batches=8,
         batch_size=8,       
         max_length=512,      # XLM-RoBERTa's max sequence length

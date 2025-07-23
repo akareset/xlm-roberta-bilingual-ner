@@ -50,13 +50,13 @@ def main():
     # IMPORTANT: Update this path to your checkpoint file
     checkpoint_path = "checkpoints/best-model-lr-1e-5-val_loss=12.57.ckpt"
     
-    print(f"🚀 Loading model from checkpoint: {checkpoint_path}")
+    print(f"Loading model from checkpoint: {checkpoint_path}")
     
     try:
         # Load the Lightning Module from the checkpoint
         model = XLMRobertaMLMModule.load_from_checkpoint(checkpoint_path)
     except FileNotFoundError:
-        print(f"❌ Error: Checkpoint file not found at '{checkpoint_path}'.")
+        print(f"Error: Checkpoint file not found at '{checkpoint_path}'.")
         print("Please make sure the path is correct.")
         return
 
